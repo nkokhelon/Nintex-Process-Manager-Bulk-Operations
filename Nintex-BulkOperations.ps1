@@ -175,6 +175,17 @@ function Read-ConfigFile {
         return $null
     }
 
+    if ($config.LoginReasonName -or $config.LoginReason) {
+        if (-not $config.LoginReasonName -or -not $config.LoginReason) {
+            Write-Host "Set both LoginReasonName and LoginReason, or leave both blank." -ForegroundColor Red
+            return $null
+        }
+        if ($config.LoginReasonName.Length -gt 50 -or $config.LoginReason.Length -gt 500) {
+            Write-Host "LoginReasonName must be at most 50 characters and LoginReason at most 500 characters." -ForegroundColor Red
+            return $null
+        }
+    }
+
     # Remove trailing slash from SiteURL if present
     $config.SiteURL = $config.SiteURL.TrimEnd('/')
 
@@ -211,6 +222,72 @@ function Get-AuthToken {
     catch {
         Write-Host "Authentication error: $($_.Exception.Message)" -ForegroundColor Red
         return $null
+    }
+}
+
+function Send-LoginReason {
+    param(
+        [string]$SiteURL,
+        [string]$Token,
+        [string]$Name,
+        [string]$Reason
+    )
+
+    try {
+        Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+        $loginUri = [uri]"$SiteURL/Home/LoginReason"
+        $groupTreeUri = [uri]"$SiteURL/Process/View/GetChildProcessGroupTreeItems"
+
+        # Bearer-only requests do not require the form's cookie-based anti-forgery token.
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        $handler.UseCookies = $false
+        $handler.AllowAutoRedirect = $false
+        $client = [System.Net.Http.HttpClient]::new($handler)
+        try {
+            $client.Timeout = [TimeSpan]::FromSeconds(60)
+            $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $Token)
+            $fields = [System.Collections.Generic.Dictionary[string,string]]::new()
+            $fields.Add('UserName', $Name)
+            $fields.Add('Reason', $Reason)
+            $fields.Add('ReturnUrl', $groupTreeUri.PathAndQuery)
+            $content = [System.Net.Http.FormUrlEncodedContent]::new($fields)
+            try {
+                Write-Host "Recording the configured system-account access reason..." -ForegroundColor Cyan
+                $response = $client.PostAsync($loginUri, $content).GetAwaiter().GetResult()
+                try {
+                    # Success redirects; HTTP 200 redisplays the form after validation fails.
+                    if ([int]$response.StatusCode -ne 302 -or -not $response.Headers.Location) {
+                        throw "Login reason was not accepted (HTTP $([int]$response.StatusCode)). Check the configured name, reason and account login state."
+                    }
+                    $redirectUri = [uri]::new($loginUri, $response.Headers.Location)
+                    if (-not $redirectUri.Equals($groupTreeUri)) {
+                        throw "Login reason returned an unexpected redirect. Not continuing."
+                    }
+                }
+                finally {
+                    $response.Dispose()
+                }
+            }
+            finally {
+                $content.Dispose()
+            }
+        }
+        finally {
+            $client.Dispose()
+        }
+
+        # A fresh token resets the login session, so verify and continue with this token.
+        $groupTree = Invoke-ApiGet -Url $groupTreeUri.AbsoluteUri -Token $Token
+        if (-not $groupTree -or $null -eq $groupTree.PSObject.Properties['treeItems']) {
+            throw "The group API is still unavailable after submitting the login reason. Not continuing."
+        }
+
+        Write-Host "Login reason accepted and group API access confirmed." -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host "Login reason error: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
     }
 }
 
@@ -834,12 +911,19 @@ function Get-ChildGroupsRecursive {
         [string]$Token,
         [string]$ParentUniqueId,
         [int]$ParentId = $null,
-        [ref]$AllGroups
+        [ref]$AllGroups,
+        [string]$ParentName = 'the selected group',
+        [switch]$RequireComplete
     )
 
     try {
+        Write-Host "  Reading subgroups of '$ParentName'... ($($AllGroups.Value.Count) groups found)" -ForegroundColor Gray
         $url = "$SiteURL/Process/View/GetChildProcessGroupTreeItems?uniqueId=$ParentUniqueId"
         $response = Invoke-ApiGet -Url $url -Token $Token
+
+        if ($RequireComplete -and (-not $response -or -not (Test-NodeHasProperty -Node $response -Name 'treeItems'))) {
+            throw "Could not read the subgroups of '$ParentName'. The group list is incomplete; stopping."
+        }
 
         if ($response -and $response.treeItems) {
             # Filter for only group items (not processes or documents)
@@ -865,12 +949,13 @@ function Get-ChildGroupsRecursive {
                 if ($group.hasChild -and $group.totalSubgroups -gt 0) {
                     Get-ChildGroupsRecursive -SiteURL $SiteURL -Token $Token `
                         -ParentUniqueId $group.uniqueId -ParentId $group.id `
-                        -AllGroups $AllGroups
+                        -AllGroups $AllGroups -ParentName $group.title -RequireComplete:$RequireComplete
                 }
             }
         }
     }
     catch {
+        if ($RequireComplete) { throw }
         Write-Host "  Error fetching children for group $ParentUniqueId : $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
@@ -878,7 +963,8 @@ function Get-ChildGroupsRecursive {
 function Get-ProcessGroups {
     param(
         [string]$SiteURL,
-        [string]$Token
+        [string]$Token,
+        [switch]$RequireComplete
     )
 
     try {
@@ -888,7 +974,12 @@ function Get-ProcessGroups {
         $url = "$SiteURL/Process/View/GetChildProcessGroupTreeItems"
         $response = Invoke-ApiGet -Url $url -Token $Token
 
+        if ($RequireComplete -and (-not $response -or -not (Test-NodeHasProperty -Node $response -Name 'treeItems'))) {
+            throw "Could not read the group list. Check your access and connection, then retry."
+        }
+
         if (-not $response -or -not $response.treeItems) {
+            if ($RequireComplete) { return @() }
             Write-Host "  Could not fetch root groups from API" -ForegroundColor Yellow
             return @()
         }
@@ -905,7 +996,7 @@ function Get-ProcessGroups {
 
         foreach ($rootGroup in $rootGroups) {
             $currentIndex++
-            Write-Host "`r  Fetching group tree $currentIndex out of $totalRootGroups..." -NoNewline -ForegroundColor Gray
+            Write-Host "  Reading '$($rootGroup.title)' (top-level group $currentIndex of $totalRootGroups)..." -ForegroundColor Gray
 
             # Add root group
             $allGroups[$rootGroup.id] = @{
@@ -922,15 +1013,15 @@ function Get-ProcessGroups {
             if ($rootGroup.hasChild -and $rootGroup.totalSubgroups -gt 0) {
                 Get-ChildGroupsRecursive -SiteURL $SiteURL -Token $Token `
                     -ParentUniqueId $rootGroup.uniqueId -ParentId $rootGroup.id `
-                    -AllGroups ([ref]$allGroups)
+                    -AllGroups ([ref]$allGroups) -ParentName $rootGroup.title -RequireComplete:$RequireComplete
             }
         }
-        Write-Host ""  # New line after progress counter
 
-        Write-Host "Successfully fetched $($allGroups.Count) groups total" -ForegroundColor Green
+        Write-Host "Group list loaded: $($allGroups.Count) groups." -ForegroundColor Green
         return $allGroups.Values | Sort-Object -Property itemOrder
     }
     catch {
+        if ($RequireComplete) { throw }
         Write-Host "Error fetching process groups: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host $_.ScriptStackTrace -ForegroundColor Red
         return @()
@@ -952,42 +1043,7 @@ function Get-ProcessGroupById {
         if ($isGuid) {
             Write-Host "Looking up group by GUID: $GroupId" -ForegroundColor Gray
 
-            # Try direct API endpoint first (most reliable)
-            $directUrl = "$SiteURL/Api/v1/ProcessGroups/$GroupId"
-            $directResponse = Invoke-ApiGet -Url $directUrl -Token $Token
-
-            # Check multiple possible response structures
-            if ($directResponse) {
-                $groupJson = $null
-
-                # Try different response structures
-                if ($directResponse.processGroupJson) {
-                    $groupJson = $directResponse.processGroupJson
-                }
-                elseif ($directResponse.id -or $directResponse.Id) {
-                    # Response might be the group object directly
-                    $groupJson = $directResponse
-                }
-                elseif ($directResponse.ProcessGroup) {
-                    $groupJson = $directResponse.ProcessGroup
-                }
-
-                if ($groupJson -and ($groupJson.UniqueId -or $groupJson.uniqueId)) {
-                    $name = if ($groupJson.Name) { $groupJson.Name } else { $groupJson.name }
-                    $id = if ($groupJson.Id) { $groupJson.Id } else { $groupJson.id }
-                    $uniqueId = if ($groupJson.UniqueId) { $groupJson.UniqueId } else { $groupJson.uniqueId }
-
-                    Write-Host "Found group: $name" -ForegroundColor Green
-
-                    return @{
-                        id = $id
-                        uniqueId = $uniqueId
-                        name = $name
-                    }
-                }
-            }
-
-            # Fallback: Search the tree for the group (silently, since this is a normal fallback)
+            # Resolve the GUID through the supported group-tree endpoint.
             $numericId = Get-GroupNumericIdFromTree -SiteURL $SiteURL -Token $Token -TargetUniqueId $GroupId
 
             if ($numericId -and $numericId -ne -1) {
@@ -3487,6 +3543,8 @@ function Invoke-BulkDeleteProcesses {
     # ---- Gather the target set -------------------------------------------
     Write-Host "`n=== GATHERING TARGETS ===" -ForegroundColor Cyan
     $rawIds = @()
+    $index = $null
+    $groups = $null
 
     if ($SourceType -eq "CSV") {
         $csv = Read-CsvWithFlexibleHeaders -Path $CsvPath
@@ -3506,19 +3564,48 @@ function Invoke-BulkDeleteProcesses {
         if (-not $Force -and -not $WhatIf) {
             $includeSubgroups = (Read-Host "Include subgroups? (Y/N)") -eq 'Y'
         }
-        $processes = Get-ProcessesFromGroup -SiteURL $SiteURL -Token $Token `
-            -GroupID $GroupID -GroupUniqueId $GroupUniqueId -IncludeSubgroups $includeSubgroups
-        $rawIds = @($processes | ForEach-Object { $_.processUniqueId })
+
+        $groups = @(Get-ProcessGroups -SiteURL $SiteURL -Token $Token -RequireComplete)
+        $selectedGroup = @($groups | Where-Object { "$($_.id)" -eq "$GroupID" })
+        if ($selectedGroup.Count -ne 1 -or ($GroupUniqueId -and $selectedGroup[0].uniqueId -ne $GroupUniqueId)) {
+            throw "The selected group could not be confirmed. Stopping before selecting any processes."
+        }
+        $groupIds = @(Get-NpmGroupDescendantId -Groups $groups -RootGroupId $GroupID `
+            -IncludeSubgroups $includeSubgroups)
+
+        Write-Host "`nSelected group: $($selectedGroup[0].name)" -ForegroundColor Cyan
+        if ($includeSubgroups) {
+            Write-Host "Including $($groupIds.Count - 1) subgroup(s)." -ForegroundColor Gray
+        } else {
+            Write-Host "Subgroups are not included." -ForegroundColor Yellow
+        }
+
+        Write-Host "Reading process lists to find active and archived processes in these groups..." -ForegroundColor Cyan
+        $index = Get-NpmProcessIndex -SiteURL $SiteURL -Token $Token -RequireComplete
+        $processes = @(Select-NpmProcessInGroup -Index $index -GroupIds $groupIds -IncludeArchived $true)
+        $rawIds = @($processes | ForEach-Object { $_.UniqueId })
+        $activeCount = @($processes | Where-Object { -not $_.IsArchived }).Count
+        $archivedCount = @($processes | Where-Object { $_.IsArchived }).Count
+
+        Write-Host "`nProcesses found in the selected groups: $activeCount active, $archivedCount archived." -ForegroundColor Green
+        Write-Host "Only processes in the selected groups are deletion targets. Documents and users are not included." -ForegroundColor Gray
     }
 
     if ($rawIds.Count -eq 0) {
-        Write-Host "No processes to delete" -ForegroundColor Yellow
+        if ($SourceType -eq 'Group') {
+            Write-Host "No active or archived processes were found in the selected groups. There is nothing to preview or delete." -ForegroundColor Yellow
+            Write-Host "This does not mean the groups contain no documents. The group folders will be left unchanged." -ForegroundColor Yellow
+        } else {
+            Write-Host "No processes to delete" -ForegroundColor Yellow
+        }
         return
     }
 
     # ---- Resolve to UniqueIds via a single index sweep --------------------
-    Write-Host "Indexing tenant processes..." -ForegroundColor Gray
-    $index = Get-NpmProcessIndex -SiteURL $SiteURL -Token $Token
+    if ($null -eq $index) {
+        Write-Host "Reading process lists to identify the selected processes..." -ForegroundColor Gray
+        $index = Get-NpmProcessIndex -SiteURL $SiteURL -Token $Token -RequireComplete
+    }
 
     $numericLookup = @{}
     foreach ($entry in $index.Values) {
@@ -3566,7 +3653,10 @@ function Invoke-BulkDeleteProcesses {
     # in the form deletion and restore actually use.
     $groupUniqueIdMap = @{}
     try {
-        foreach ($g in @(Get-ProcessGroups -SiteURL $SiteURL -Token $Token)) {
+        if ($null -eq $groups) {
+            $groups = @(Get-ProcessGroups -SiteURL $SiteURL -Token $Token)
+        }
+        foreach ($g in $groups) {
             if ($null -ne $g.id) { $groupUniqueIdMap["$($g.id)"] = $g.uniqueId }
         }
     } catch {
@@ -4724,6 +4814,15 @@ function Start-BulkOperations {
     if (-not $token) {
         Write-Host "Authentication failed. Cannot proceed." -ForegroundColor Red
         return 3
+    }
+
+    if ($config.LoginReasonName) {
+        $loginReasonAccepted = Send-LoginReason -SiteURL $config.SiteURL -Token $token `
+            -Name $config.LoginReasonName -Reason $config.LoginReason
+        if (-not $loginReasonAccepted) {
+            Write-Host "Cannot proceed until the login reason is accepted and API access is confirmed." -ForegroundColor Red
+            return 3
+        }
     }
 
     # ---- Non-interactive: run the one mode and exit with a status code ----

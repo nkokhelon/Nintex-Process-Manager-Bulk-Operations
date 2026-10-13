@@ -2482,7 +2482,7 @@ function Write-NpmProgress {
         [int]$Done,
         [int]$Total,
         [int]$Id = 1,
-        [int]$Every = 10
+        [int]$Every = 1
     )
 
     if ($Total -le 0) { return }
@@ -2492,7 +2492,7 @@ function Write-NpmProgress {
 
     # A console counter as well: Write-Progress renders nothing in a transcript
     # or a redirected host, which is exactly where a long run is watched from.
-    if ($Every -gt 0 -and ($Done % $Every) -eq 0) {
+    if ($Every -gt 0 -and ($Done -eq 1 -or $Done -eq $Total -or ($Done % $Every) -eq 0)) {
         Write-Host "`r    $Status`: $Done of $Total..." -NoNewline -ForegroundColor Gray
     }
 }
@@ -2547,24 +2547,39 @@ function Get-NpmProcessIndex {
     param(
         [string]$SiteURL,
         [string]$Token,
-        [int]$PageSize = 200
+        [int]$PageSize = 200,
+        [switch]$RequireComplete
     )
 
     $index = @{}
 
     foreach ($listType in @(0, 7)) {
         $isArchived = ($listType -eq 7)
+        $stateName = if ($isArchived) { 'archived' } else { 'active' }
+        $readCount = 0
         $page = 1
+        Write-Host "  Reading $stateName processes..." -ForegroundColor Gray
 
         do {
             $url = "$SiteURL/Bff/Process/api/v1/processes?Page=$page&PageSize=$PageSize&ListType=$listType"
             $result = Invoke-NpmApi -Url $url -Token $Token -Method Get
-            if (-not $result.Success) { break }
+            if (-not $result.Success) {
+                $message = "Could not finish reading $stateName processes. Check your access and connection, then retry."
+                if ($RequireComplete) { throw $message }
+                Write-Host $message -ForegroundColor Red
+                break
+            }
+            if ($RequireComplete -and -not (Test-NodeHasProperty -Node $result.Response -Name 'items')) {
+                throw "The $stateName process list returned an unexpected response. Stopping rather than using an incomplete list."
+            }
 
             $items = Get-NodeArray -Node $result.Response -Name 'items'
             foreach ($item in $items) {
                 $uniqueId = [string](Get-NodeValue -Node $item -Name 'processUniqueId')
-                if (-not $uniqueId) { continue }
+                if (-not $uniqueId) {
+                    if ($RequireComplete) { throw "A process in the $stateName list has no identifier. Stopping rather than skipping it." }
+                    continue
+                }
 
                 $index[$uniqueId.ToLowerInvariant()] = [PSCustomObject]@{
                     UniqueId    = $uniqueId
@@ -2579,6 +2594,8 @@ function Get-NpmProcessIndex {
                     GroupExistsReported = (Test-NodeHasProperty -Node $item -Name 'groupExists')
                 }
             }
+            $readCount += $items.Count
+            Write-Host "    $readCount $stateName process(es) read." -ForegroundColor Gray
 
             $page++
         } while ($result.Success -and $items.Count -eq $PageSize)
@@ -2966,7 +2983,7 @@ function Find-HiddenInputOutputReference {
         foreach ($id in $activeIds) {
             $done++
             Write-NpmProgress -Activity 'Input/Output blind-spot scan' -Status 'Active processes' `
-                -Done $done -Total $activeIds.Count -Id 2 -Every 25
+                -Done $done -Total $activeIds.Count -Id 2
 
             # Served from the planning cache when an earlier phase already read
             # this process; otherwise fetched and cached for the phases after.
@@ -3294,11 +3311,11 @@ function New-ProcessDeletePlan {
         $candidates = @(Get-DependencyCandidate -Claims $allClaims -TargetUniqueIds $TargetUniqueIds)
         Write-Host "  $($allClaims.Count) claim(s) across $($candidates.Count) process(es)" -ForegroundColor Gray
 
-        Write-Host "  Building ledger for $($candidates.Count) process(es)..." -ForegroundColor Gray
+        Write-Host "  Reading details for $($candidates.Count) process(es)..." -ForegroundColor Gray
         $done = 0
         foreach ($candidate in $candidates) {
             $done++
-            Write-NpmProgress -Activity "Discovery pass $pass" -Status 'Fetching process models' `
+            Write-NpmProgress -Activity "Discovery pass $pass" -Status 'Reading process details' `
                 -Done $done -Total $candidates.Count -Id 1
             [void](Add-LedgerEntry -UniqueId $candidate)
         }

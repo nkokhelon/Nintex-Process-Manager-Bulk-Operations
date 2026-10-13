@@ -28,6 +28,13 @@ DefaultRestoreGroupID=
 # If not specified, will use "Bulk Delete Temporary Group"
 TempGroupName=Bulk Delete Temporary Group
 
+# Optional for Nintex-BulkOperations.ps1 when using an inbuilt system account.
+# Set both: your real name (max 50 characters) and access reason (max 500).
+# Records an access-audit entry after login, including during previews.
+# Leave both blank for normal accounts. Keep the reason accurate for each run.
+LoginReasonName=
+LoginReason=
+
 # Change description written against every process Mode 1 archives. Set it once
 # so the audit trail reads consistently across a cleanup.
 ArchiveChangeDescription=Bulk Cleanup.
